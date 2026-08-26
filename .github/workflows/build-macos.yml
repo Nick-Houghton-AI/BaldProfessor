@@ -1,0 +1,148 @@
+# macOS release build. NOT active here: copy this into the PUBLIC repo's
+# .github/workflows/ when you need Mac binaries, run it, then delete it again
+# along with the deploy key and the MAC_SRC_KEY secret.
+#
+# Why it lives in the public repo rather than this one: GitHub only meters
+# Actions minutes for private repositories, and this repo's account is blocked
+# on billing. Public repos get macOS runners free, and that still works while
+# the account is payment-blocked. The source is pulled in over a temporary
+# read-only deploy key, so it never becomes public. Only the built .app leaves
+# the runner.
+#
+# Setup, each time:
+#   ssh-keygen -t ed25519 -N "" -f key
+#   gh api -X POST /repos/Nick-Houghton-AI/BaldProfessor-source/keys \
+#     -f title="temp-mac-build" -f key="$(cat key.pub)" -F read_only=true
+#   gh secret set MAC_SRC_KEY -R Nick-Houghton-AI/BaldProfessor < key
+# Teardown: delete the key by id, `gh secret delete MAC_SRC_KEY`, remove the
+# workflow file.
+name: build-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch of the private source repo to build"
+        default: "v1.0.1"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            tag: arm64
+          - os: macos-15-intel
+            tag: intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Fetch private source
+        env:
+          KEY: ${{ secrets.MAC_SRC_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 --branch "${{ github.event.inputs.ref }}" \
+            git@github.com:Nick-Houghton-AI/BaldProfessor-source.git src
+          rm -f ~/.ssh/id_ed25519
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nuitka requests pypdf python-pptx python-docx pillow fpdf2 openpyxl
+
+      - name: Build
+        working-directory: src
+        run: python packaging/build.py
+
+      - name: Inspect the bundle
+        working-directory: src
+        run: |
+          ls -la dist
+          APP=$(ls -d dist/*.app | head -1)
+          echo "bundle: $APP"
+          /usr/libexec/PlistBuddy -c Print "$APP/Contents/Info.plist" || true
+          # Read the real executable name: `ls | head -1` returns _blake2.so.
+          BIN="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" "$APP/Contents/Info.plist")"
+          echo "executable: $BIN"
+          file "$BIN"
+          codesign -dv --verbose=2 "$APP" 2>&1 || echo "NOT SIGNED"
+
+      - name: Smoke test - launch the app and talk to it
+        working-directory: src
+        timeout-minutes: 6
+        run: |
+          APP=$(ls -d dist/*.app | head -1)
+          BIN="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" "$APP/Contents/Info.plist")"
+          # Detach stdout. Left on the step's pipe, the step never finishes even
+          # after the process is killed.
+          "$BIN" >/tmp/app.log 2>&1 </dev/null &
+          PID=$!
+          ok=""
+          for i in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:8765/" -o /tmp/home.html; then ok=1; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "APP DID NOT SERVE"; cat /tmp/app.log; kill -9 $PID 2>/dev/null; exit 1
+          fi
+          echo "served $(wc -c < /tmp/home.html) bytes, ready in ${i}s"
+          grep -q "Bald Professor" /tmp/home.html && echo "home page OK" || echo "MARKER MISSING"
+          curl -fsS "http://127.0.0.1:8765/api/update" || echo "(no update endpoint)"; echo
+          curl -fsS "http://127.0.0.1:8765/api/ai/detect" | head -c 300; echo
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Origin: https://evil.example' -H 'Content-Type: text/plain' \
+            --data '{}' "http://127.0.0.1:8765/api/config")
+          echo "cross-site POST -> $code"
+          cat /tmp/app.log
+          kill -9 $PID 2>/dev/null || true
+          pkill -9 -f '\.app/Contents/MacOS' 2>/dev/null || true
+          [ "$code" = "403" ] || { echo "CSRF CHECK FAILED"; exit 1; }
+
+      - name: Smoke test - MCP server
+        working-directory: src
+        timeout-minutes: 4
+        run: |
+          APP=$(ls -d dist/*.app | head -1)
+          BIN="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" "$APP/Contents/Info.plist")"
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' > /tmp/mcp-in.jsonl
+          "$BIN" --mcp < /tmp/mcp-in.jsonl > /tmp/mcp-out.jsonl 2>/dev/null &
+          PID=$!
+          for i in $(seq 1 60); do
+            grep -q '"tools"' /tmp/mcp-out.jsonl 2>/dev/null && break
+            sleep 1
+          done
+          kill -9 $PID 2>/dev/null || true
+          python3 - <<'PY'
+          import json
+          for line in open("/tmp/mcp-out.jsonl"):
+              r = json.loads(line).get("result", {})
+              if "serverInfo" in r:
+                  print("serverInfo:", r["serverInfo"])
+              if "tools" in r:
+                  print("tools:", len(r["tools"]))
+          PY
+
+      - name: Checksums
+        if: always()
+        working-directory: src
+        run: cat dist/SHA256SUMS-*.txt || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaldProfessor-macOS-${{ matrix.tag }}
+          path: |
+            src/dist/BaldProfessor-Mac-*.zip
+            src/dist/BaldProfessor-Mac-*.dmg
+          if-no-files-found: error
